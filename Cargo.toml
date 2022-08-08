@@ -12,9 +12,6 @@ path = "bench/bench.rs"
 harness = false
 
 [dependencies]
-criterion = { version = "0.3.4", features = ["real_blackbox"] }
+criterion = { version = "0.3.6", features = ["real_blackbox"] }
 libc = "0.2"
-thread-id = "3"
-
-[build-dependencies]
-cc = "1"
+thread-id = "4"

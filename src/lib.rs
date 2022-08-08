@@ -1,264 +1,168 @@
-#![feature(thread_local, once_cell, current_thread_id)] //, core_intrinsics)]
-extern crate criterion;
-// use core::intrinsics::unlikely;
+#![feature(thread_local)]
+#![cfg_attr(feature = "current_thread_id", feature(current_thread_id))]
 use criterion::*;
-use libc::pthread_getspecific;
-use std::sync::LazyLock;
-// use core::hint::black_box;
-// #[cfg(not(feature = "no-c"))]
-extern "C" {
-    fn have_thread_id_shim() -> u8;
-    fn thread_id_shim() -> u8;
+/* aarch64-apple-darwin
+ThreadId::current()               time:   [960.59 ps 962.20 ps 964.00 ps]
+std::thread::current().id()       time:   [9.7884 ns 9.8084 ns 9.8270 ns]
+core::arch::asm! thread id        time:   [333.13 ps 333.95 ps 334.75 ps]
+thread_local cache current().id() time:   [972.45 ps 974.64 ps 976.86 ps]
+thread_id crate                   time:   [1.9546 ns 1.9604 ns 1.9658 ns]
+pointer to thread_local!          time:   [982.80 ps 987.58 ps 993.38 ps]
+pointer to #[thread_local]        time:   [957.50 ps 960.68 ps 964.12 ps]
+pthread_self                      time:   [1.9226 ns 1.9283 ns 1.9341 ns]
+
+*/
+
+thread_local! {
+    static BYTE: u8 = const { 0 };
+    static LAZY_THREAD_ID: std::thread::ThreadId = std::thread::current().id();
 }
 
-extern "C" {
-    #[cfg(not(target_os = "dragonfly"))]
-    #[cfg_attr(
-        any(target_os = "macos", target_os = "ios", target_os = "freebsd"),
-        link_name = "__error"
-    )]
-    #[cfg_attr(
-        any(
-            target_os = "openbsd",
-            target_os = "netbsd",
-            target_os = "bitrig",
-            target_os = "android"
-        ),
-        link_name = "__errno"
-    )]
-    #[cfg_attr(
-        any(target_os = "solaris", target_os = "illumos"),
-        link_name = "___errno"
-    )]
-    #[cfg_attr(target_os = "linux", link_name = "__errno_location")]
-    fn errno_location() -> *mut libc::c_int;
-}
-
-std::thread_local! { static TLMAC_BYTE: u8 = const { 0 }; }
-std::thread_local! { static TLMAC_BOX: Box<u8> = Box::new(0); }
 #[thread_local]
-static TLATTR_BYTE: u8 = 0;
-
-#[inline]
-fn tid_tlsaddr_macro() -> usize {
-    TLMAC_BYTE.with(|v| v as *const _ as usize)
-}
-#[inline]
-fn tid_tlsbox_macro() -> usize {
-    TLMAC_BOX.with(|v: &Box<u8>| {
-        let inner: &u8 = &**v;
-        inner as *const u8 as usize
-    })
-}
-
-#[inline]
-fn tid_tlsaddr_attr() -> usize {
-    &TLATTR_BYTE as *const _ as usize
-}
-
-#[inline]
-fn tid_errno() -> usize {
-    unsafe { errno_location() as usize }
-}
-
-#[inline]
-fn tid_std_thread() -> std::thread::ThreadId {
-    std::thread::current().id()
-}
-
-// unsigned* cpu, unsigned* node, void* unused
-type GetCpu = extern "C" fn(
-    cpu: *mut libc::c_uint,
-    node: *mut libc::c_uint,
-    _unused: *mut core::ffi::c_void,
-) -> libc::c_int;
-#[cfg(unix)]
-unsafe fn get_getcpu() -> Option<GetCpu> {
-    if cfg!(target_os = "linux") {
-        let h = libc::dlopen(
-            "linux-vdso.so.1\0".as_ptr().cast(),
-            libc::RTLD_LAZY | libc::RTLD_LOCAL | libc::RTLD_NOLOAD,
-        );
-        if h.is_null() {
-            return None;
-        }
-        let r = libc::dlsym(h, "__vdso_getcpu\0".as_ptr().cast());
-        if r.is_null() {
-            return None;
-        }
-        Some(core::mem::transmute(r))
-    } else {
-        None
-    }
-}
-
-#[cfg(not(unix))]
-fn get_getcpu() -> Option<GetCpu> {
-    None
-}
-
-#[inline]
-fn getcpu(f: GetCpu) -> (u32, u32) {
-    let mut core = 0;
-    let mut node = 0;
-    f(&mut core, &mut node, core::ptr::null_mut());
-    (core, node)
-}
-
-// TLS register on x86 is in the FS or GS register, see: https://akkadia.org/drepper/tls.pdf
-#[cfg(target_vendor = "apple")]
-#[inline]
-#[allow(unused_assignments)]
-fn asm_thread_id() -> usize {
-    let mut o = 0usize;
-    #[cfg(any(
-        target_arch = "x86",
-        all(target_arch = "x86_64", target_vendor = "apple"),
-    ))]
-    unsafe {
-        asm!(
-            "mov {}, gs:[0]",
-            out(reg) o,
-            options(nostack, readonly, preserves_flags)
-        );
-    }
-    #[cfg(all(target_arch = "x86_64", not(target_vendor = "apple"),))]
-    unsafe {
-        asm!(
-            "mov {}, fs:[0]",
-            out(reg) o,
-            options(nostack, readonly, preserves_flags)
-        );
-    }
-    #[cfg(target_arch = "arm")]
-    unsafe {
-        asm!(
-            "mrc p15, 0, {}, c13, c0, 3",
-            out(reg) o,
-            options(nostack, readonly),// preserves flags?
-        );
-        // lower 2 bits are cpu number — fixme: is this true on non-apple?
-        o = o & !3;
-    }
-    #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
-    unsafe {
-        core::arch::asm!(
-            "mrs {}, tpidrro_el0",
-            out(reg) o,
-            options(nostack, readonly),// preserves flags?
-        );
-    }
-    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
-    unsafe {
-        core::arch::asm!(
-            "mrs {}, tpidr_el0",
-            out(reg) o,
-            options(nostack, readonly),// preserves flags?
-        );
-    }
-    o
-}
-
-#[cfg(all(windows, any(target_arch = "x86", target_arch = "x86_64")))]
-#[inline]
-fn asm_thread_id() -> usize {
-    let mut o = 0usize;
-    #[cfg(target_arch = "x86")]
-    unsafe {
-        core::arch::asm!(
-            "mov {}, gs:[{}]",
-            out(reg) o,
-            const 0x30,
-            options(nostack, readonly, preserves_flags)
-        );
-    }
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        core::arch::asm!(
-            "mov {}, fs:[{}]",
-            out(reg) o,
-            const 0x18,
-            options(nostack, readonly, preserves_flags)
-        );
-    }
-    return o;
-}
-
-static LAZYKEY: LazyLock<libc::pthread_key_t> = LazyLock::new(|| unsafe {
-    let mut key = core::mem::MaybeUninit::<libc::pthread_key_t>::zeroed();
-    libc::pthread_key_create(key.as_mut_ptr(), None);
-    key.assume_init()
-});
-
-static KEY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static BYTE2: u8 = 0;
 
 pub fn thread_id_benches(c: &mut Criterion) {
+    #[cfg(feature = "current_thread_id")]
     c.bench_function("ThreadId::current()", |b| {
         b.iter(|| std::thread::ThreadId::current());
     });
+    c.bench_function("core::arch::asm! thread id", |b| {
+        b.iter(|| unsafe { asm_thread_id() })
+    });
     c.bench_function("std::thread::current().id()", |b| {
-        b.iter(|| tid_std_thread());
+        b.iter(|| std::thread::current().id());
     });
-    c.bench_function("thread_local! addr", |b| {
-        b.iter(|| tid_tlsaddr_macro());
+    c.bench_function("thread_local cache current().id()", |b| {
+        b.iter(|| LAZY_THREAD_ID.with(|id| *id));
     });
-    c.bench_function("thread_local! lazy+dtor", |b| {
-        b.iter(|| tid_tlsbox_macro());
+    c.bench_function("thread_id crate", |b| b.iter(|| thread_id::get()));
+    c.bench_function("pointer to thread_local!", |b| {
+        b.iter(|| BYTE.with(|b| b as *const u8 as usize));
     });
-    c.bench_function("#[thread_local] addr", |b| {
-        b.iter(|| tid_tlsaddr_attr());
+    c.bench_function("pointer to #[thread_local]", |b| {
+        b.iter(|| (&BYTE2) as *const u8 as usize)
     });
-    c.bench_function("errno address", |b| {
-        b.iter(|| tid_errno());
+    c.bench_function("pthread_self", |b| {
+        b.iter(|| unsafe { libc::pthread_self() as usize })
     });
-    if let Some(vdso_getcpu) = unsafe { get_getcpu() } {
-        c.bench_function("vdso_getcpu", |b| {
-            b.iter(|| getcpu(vdso_getcpu));
-        });
-    }
-    #[cfg(unix)]
-    {
-        c.bench_function("pthread_self", |b| {
-            b.iter(|| unsafe { libc::pthread_self() as usize });
-        });
-        let mut key = core::mem::MaybeUninit::<libc::pthread_key_t>::zeroed();
-        unsafe { libc::pthread_key_create(key.as_mut_ptr(), None) };
-        let key = unsafe { key.assume_init() };
-        c.bench_function("pthread_getspecific", |b| {
-            b.iter(|| unsafe { pthread_getspecific(key) });
-        });
-        KEY.store(key, core::sync::atomic::Ordering::Release);
-        c.bench_function("pthread_getspecific acq", |b| {
-            b.iter(|| unsafe {
-                pthread_getspecific(KEY.load(std::sync::atomic::Ordering::Acquire))
-            });
-        });
-        c.bench_function("pthread_getspecific with SyncLazy key init", |b| {
-            b.iter(|| unsafe {
-                pthread_getspecific(*LAZYKEY);
-            })
-        });
-    }
+    #[cfg(target_os = "linux")]
+    c.bench_function("gettid (linux)", |b| {
+        b.iter(|| unsafe { libc::gettid() as usize })
+    });
+}
 
-    c.bench_function("thread_id::get()", |b| {
-        b.iter(|| thread_id::get());
-    });
+/// WARNING: this is not nearly tested enough def has bugs. Don't use for real.
+#[allow(unused_assignments)]
+#[inline]
+unsafe fn asm_thread_id() -> usize {
+    use std::arch::asm;
+    let mut output = 0usize;
 
-    #[cfg(any(
-        all(windows, any(target_arch = "x86", target_arch = "x86_64")),
-        target_vendor = "apple",
-    ))]
-    {
-        c.bench_function("use core::arch::asm!", |b| {
-            b.iter(|| asm_thread_id());
-        });
-    }
-    // #[cfg(not(feature = "no-c"))]
-    {
-        if unsafe { have_thread_id_shim() } != 0 {
-            c.bench_function("call into inline asm in c", |b| {
-                b.iter(|| black_box(unsafe { thread_id_shim() }));
-            });
+    cfg_if::cfg_if! {
+        if #[cfg(all(target_os = "macos", target_arch = "x86_64"))] {
+            asm!(
+                "mov {}, gs:0",
+                out(reg) output,
+                options(nostack, readonly, preserves_flags)
+            );
+        }
+        else if #[cfg(all(target_os = "macos", target_arch = "x86"))] {
+            asm!(
+                "mov {}, fs:0",
+                out(reg) output,
+                options(nostack, readonly, preserves_flags)
+            );
+        }
+        else if #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))] {
+            asm!(
+                "mrs {}, tpidrro_el0",
+                out(reg) output,
+                options(nostack, readonly, preserves_flags),
+            );
+            // 3 bits used for cpu number?
+            output &= !7;
+        }
+        else if #[cfg(all(windows, target_arch = "x86_64"))] {
+            // mov {}, gs:[{}]
+            asm!(
+                "mov {}, gs:48",
+                out(reg) output,
+                options(nostack, readonly, preserves_flags)
+            );
+        } else if #[cfg(all(windows, target_arch = "x86"))] {
+            asm!(
+                "mov {}, fs:24",
+                out(reg) output,
+                options(nostack, readonly, preserves_flags)
+            );
+        } else if #[cfg(all(windows, target_arch = "aarch64"))] {
+            asm!(
+                "mov {}, x18",
+                out(reg) output,
+                options(nostack, readonly, preserves_flags)
+            );
+        } else if #[cfg(all(windows, target_arch = "arm", any()))] {
+            #[link(name = "ntdll", kind = "dylib")]
+            extern "system" {
+                fn NtCurrentTeb() -> *mut core::ffi::c_void;
+            }
+            NtCurrentTeb() as usize
+            // asm!(
+            //     "mov {}, x18",
+            //     out(reg) output,
+            //     options(nostack, readonly, preserves_flags)
+            // );
+        } else if #[cfg(any(all(target_arch = "x86_64", target_os = "linux")))] {
+            asm!(
+                "mov {}, fs:0",
+                out(reg) output,
+                options(nostack, readonly, preserves_flags)
+            );
+        }
+        // untested!
+        else if #[cfg(all(target_arch = "x86", target_os = "linux"))] {
+            // Maybe???
+            asm!(
+                "mov {}, gs:0",
+                out(reg) output,
+                options(nostack, readonly, preserves_flags)
+            );
+        }
+        // also untested!
+        else if #[cfg(all(target_arch = "aarch64", any(target_os = "android", target_os = "linux")))] {
+            type VoidP = *const core::ffi::c_void;
+            let mut tpidr: *const VoidP = core::ptr::null();
+            asm!(
+                "mrs {}, tpidr_el0",
+                out(reg) output,
+                options(nostack, readonly, preserves_flags)
+            );
+            let align_mask = core::mem::align_of::<VoidP>() - 1;
+            debug_assert!(!tpidr.is_null() && 0 == (tpidr as usize & align_mask));
+            #[cfg(target_os = "android")]
+            output = tpidr.add(1).read() as usize;
+            #[cfg(target_os = "linux")]
+            output = tpidr.read() as usize;
+        }
+        // still untested!
+        else if #[cfg(all(target_arch = "arm", any(target_os = "android", target_os = "linux")))] {
+            type VoidP = *const core::ffi::c_void;
+            let mut tpidr: *const VoidP = core::ptr::null();
+            asm!(
+                "mrc p15, 0, {0}, c13, c0, 3",
+                "bic {0}, {0}, #3",
+                out(reg) output,
+                options(nostack, readonly, preserves_flags),
+            );
+            let align_mask = core::mem::align_of::<VoidP>() - 1;
+            debug_assert!(!tpidr.is_null() && 0 == (tpidr as usize & align_mask));
+            #[cfg(target_os = "android")]
+            output = tpidr.add(1).read() as usize;
+            #[cfg(target_os = "linux")]
+            output = tpidr.read() as usize;
+        } else {
+            panic!();
         }
     }
+    output
 }
